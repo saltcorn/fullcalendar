@@ -519,23 +519,48 @@ const get_state_fields = async (table_id, viewname, { show_view }) => {
     return sf;
   });
 };
+const isPlainDate = (d) =>
+  !!d &&
+  typeof d === "object" &&
+  d.constructor &&
+  d.constructor.name === "PlainDate";
+const asJsDate = (date) => (isPlainDate(date) ? date.toDate() : new Date(date));
+const sameKindAs = (template, jsDate) =>
+  isPlainDate(template) ? new template.constructor(jsDate) : jsDate;
 function addSeconds(date, secs) {
   // adds seconds to date and returns new date
-  const r = new Date(date);
+  const r = asJsDate(date);
   r.setSeconds(r.getSeconds() + secs);
-  return r;
+  return sameKindAs(date, r);
 }
 const applyDelta = (old, delta) => {
   const msAsSecs = delta.milliseconds !== 0 ? delta.milliseconds / 1000 : 0;
   const daysAsSecs = 24 * 60 * 60 * delta.days;
-  const newDate = addSeconds(old, msAsSecs + daysAsSecs);
+  const newDate = asJsDate(old);
+  newDate.setSeconds(newDate.getSeconds() + msAsSecs + daysAsSecs);
   if (delta.months !== 0) newDate.setMonth(newDate.getMonth() + delta.months);
   if (delta.years !== 0)
     newDate.setFullYear(newDate.getFullYear() + delta.years);
-  return newDate;
+  return sameKindAs(old, newDate);
+};
+const localMidnight = (day) => {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+const valueForDateField = (fields, fieldName, instant, localStr) => {
+  const field = fieldName && fields.find((f) => f.name === fieldName);
+  if (!field || !field.attributes || !field.attributes.day_only) return instant;
+  const day =
+    typeof localStr === "string"
+      ? (localStr.match(/^\d{4}-\d{2}-\d{2}/) || [])[0]
+      : null;
+  return day ? localMidnight(day) : null;
 };
 const isValidDate = (date) => {
-  return date instanceof Date && !isNaN(date);
+  return (
+    (date instanceof Date && !isNaN(date)) ||
+    (isPlainDate(date) && date.isValid())
+  );
 };
 const unitSeconds = (duration_units) => {
   //number of seconds per unit- ie if the duration unit is 1 minute, this is 60 seconds. multiply by duration to get length of event in seconds.
@@ -631,11 +656,13 @@ const eventFromRow = async (
     ) {
       const exdates = overrideMap
         .get(row[event_uid_field])
-        .map((d) => moment(d).utc().format("YYYYMMDDTHHmmSS") + "Z")
+        .map((d) => moment(asJsDate(d)).utc().format("YYYYMMDDTHHmmSS") + "Z")
         .join(",");
       if (exdates) rruleStr = `${rruleStr}\nEXDATE:${exdates}`;
     }
-    ev.rrule = `DTSTART:${moment(start).format("YYYYMMDDTHHmmSS")}\n${rruleStr}`;
+    ev.rrule = `DTSTART:${moment(asJsDate(start)).format(
+      "YYYYMMDDTHHmmSS"
+    )}\n${rruleStr}`;
     ev.duration =
       start?.getTime && end?.getTime
         ? end.getTime() - start.getTime()
@@ -823,7 +850,7 @@ const run =
         }));
       }
     }
-    console.log({ modcfg });
+    // console.log({ modcfg });
 
     return (
       (caldav_url
@@ -1087,6 +1114,7 @@ const run =
       const rowId = info.event.id;
       const dataObj = { 
         rowId, start: info.event.start, end: info.event.end, 
+        startStr: info.event.startStr, endStr: info.event.endStr,
         tableId: info.event.extendedProps.tableId,
       };
       view_post('${viewname}', 'update_calendar_event', dataObj,
@@ -1122,6 +1150,7 @@ const run =
         const dataObj = { 
           rowId, delta: info.delta, allDay: info.event.allDay, 
           start: info.event.start, end: info.event.end,
+          startStr: info.event.startStr, endStr: info.event.endStr,
           tableId: info.event.extendedProps.tableId,
         };
         view_post('${viewname}', 'update_calendar_event', dataObj,
@@ -1446,7 +1475,7 @@ const update_calendar_event = async (
     resource_field,
     rrule_field,
   },
-  { rowId, tableId, delta, allDay, start, end },
+  { rowId, tableId, delta, allDay, start, end, startStr, endStr },
   { req }
 ) => {
   const table = await Table.findOne({ id: tableId });
@@ -1476,12 +1505,18 @@ const update_calendar_event = async (
     allDayChanged = true;
   }
   const startAsDate = start ? new Date(start) : null;
-  if (
-    isValidDate(startAsDate) &&
-    startAsDate.getTime() !== row[start_field].getTime()
-  )
-    updateVals[start_field] = startAsDate;
   const endAsDate = end ? new Date(end) : null;
+  const newStart = valueForDateField(
+    fields,
+    start_field,
+    startAsDate,
+    startStr
+  );
+  if (
+    isValidDate(newStart) &&
+    (!row[start_field] || newStart.getTime() !== row[start_field].getTime())
+  )
+    updateVals[start_field] = newStart;
   if (switch_to_duration) {
     const isFloat = duration_field && durationIsFloat(fields, duration_field);
     if (isValidDate(endAsDate) && isValidDate(startAsDate)) {
@@ -1495,10 +1530,11 @@ const update_calendar_event = async (
       )
         updateVals[duration_field] = newDuration;
     }
-  } else if (end_field && isValidDate(endAsDate)) {
-    updateVals[end_field] = endAsDate;
-  } else if (end_field && allDayChanged && !isEmptyDelta(delta)) {
-    updateVals[end_field] = applyDelta(row[end_field], delta);
+  } else if (end_field) {
+    const newEnd = valueForDateField(fields, end_field, endAsDate, endStr);
+    if (isValidDate(newEnd)) updateVals[end_field] = newEnd;
+    else if (allDayChanged && !isEmptyDelta(delta))
+      updateVals[end_field] = applyDelta(row[end_field], delta);
   }
   if (Object.keys(updateVals).length !== 0)
     await table.updateRow(updateVals, rowId, req.user);
